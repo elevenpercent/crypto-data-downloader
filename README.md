@@ -1,14 +1,14 @@
 # crypto-data-downloader
 
-Download historical 1-minute OHLCV candle data for any crypto pair, from 2011 to present. Merges multiple exchange sources automatically for maximum coverage.
+Download historical 1-minute OHLCV candle data for any crypto pair, from 2011 to present. Automatically merges multiple exchange sources for maximum coverage.
 
 ---
 
 ## What it does
 
-- Downloads 1-minute open/high/low/close/volume candles for a given symbol and year
-- Pulls from the best available source for that time period (Binance for recent data, legacy exchanges for pre-2017)
-- When multiple sources are available, merges and deduplicates by timestamp
+- Downloads 1-minute open/high/low/close/volume candles for a given symbol and year (or date range)
+- Tries all available sources in priority order, merges and deduplicates by timestamp
+- Once any source reaches 99% coverage for a month, remaining sources are skipped
 - Detects and warns on gaps in the data
 - Saves everything as a compressed CSV inside a zip file
 
@@ -49,6 +49,10 @@ python3 download_crypto_data.py --symbol BTC_USDT --year 2019
 python3 download_crypto_data.py --symbol ethusdt --year 2016
 python3 download_crypto_data.py --symbol ltcusdt --year 2014
 
+# Date range (exact start/end timestamps, inclusive)
+python3 download_crypto_data.py --symbol btcusdt --start "2023-03-15 09:45" --end "2023-06-20 16:00"
+python3 download_crypto_data.py --symbol btcusdt --start 2014-01-01 --end 2014-06-30
+
 # Force a specific exchange
 python3 download_crypto_data.py --symbol btcusdt --year 2015 --source bitstamp
 python3 download_crypto_data.py --symbol ethusdt --year 2016 --source bitfinex
@@ -62,7 +66,9 @@ python3 download_crypto_data.py --list-pairs
 | Flag | Description |
 |------|-------------|
 | `--symbol` | Trading pair in any format: `btcusdt`, `BTC/USDT`, `btc-usdt`, `BTC_USDT` |
-| `--year` | Four-digit year, e.g. `2023` |
+| `--year` | Four-digit year, e.g. `2023`. Mutually exclusive with `--start`/`--end` |
+| `--start` | Range start: `2013-01-02` or `"2013-01-02 09:45"` (UTC) |
+| `--end` | Range end: `2013-12-20` or `"2013-12-20 16:00"` (UTC) |
 | `--source` | Force a specific exchange: `binance`, `okx`, `bybit`, `bitfinex`, `kraken`, `bitstamp` |
 | `--list-pairs` | Print all supported pairs per exchange and exit |
 
@@ -72,6 +78,7 @@ python3 download_crypto_data.py --list-pairs
 
 ```
 AllData/{symbol}/{symbol}_{year}.zip
+AllData/{symbol}/{symbol}_{start-date}_{end-date}.zip
 ```
 
 Each zip contains a single CSV file with these columns:
@@ -108,14 +115,15 @@ timestamp,open,high,low,close,volume
 
 ### Source selection logic
 
-The script automatically picks the best source(s) for each symbol + year:
+Sources are tried in priority order for each month. Once any source hits ≥99% coverage, the rest are skipped.
 
-- **2021+** — Binance → OKX → Bybit
-- **2019–2020** — Binance → OKX
-- **2017–2018** — Binance only
-- **2013–2016** — Bitfinex → Kraken → Bitstamp
-
-Once any single source reaches 99% coverage for a month, the remaining sources are skipped. When multiple sources are used, rows are merged and deduplicated by timestamp.
+| Era | Sources tried |
+|-----|--------------|
+| 2021+ | Binance Vision → OKX → Bybit |
+| 2019–2020 | Binance Vision → OKX |
+| 2017–2018 | Binance Vision |
+| 2013–2016 | Bitfinex → Kraken → Bitstamp |
+| 2011–2012 | Bitstamp |
 
 ---
 
@@ -123,31 +131,29 @@ Once any single source reaches 99% coverage for a month, the remaining sources a
 
 **Coinbase Exchange** — Their public candles API now requires authentication. Not supported.
 
-**Bybit** — Geo-blocked from US IP addresses (returns 403). Skipped gracefully with a warning if unavailable. Users outside the US may have access.
+**Bybit** — Geo-blocked from US IP addresses (returns 403). Skipped gracefully if unavailable.
 
-**Poloniex** — Their new API has no 1-minute historical data depth. Not supported despite having a large altcoin history from 2014–2016.
+**Poloniex** — Their new API has no 1-minute historical data depth. Not supported.
 
-**OKX** — Historical 1-minute data only goes back to January 2019, not 2018 as their documentation suggests.
+**OKX** — Historical 1-minute data only goes back to January 2019.
 
-**DOGE/USDT before 2020** — DOGE was only traded against BTC on early exchanges, not USD/USDT. The script will return 0 candles for `dogeusdt` before ~2020, which is correct.
+**DOGE/USDT before 2020** — DOGE was only traded against BTC on early exchanges. Expect 0 candles for `dogeusdt` before ~2020.
 
-**ETH before March 2016** — ETH/USD pairs didn't exist on major exchanges until mid-2015, and had extremely sparse trading through early 2016. Expect low coverage and many gap warnings for `ethusdt` before mid-2016.
+**ETH before March 2016** — ETH/USD pairs had very sparse trading through early 2016. Expect low coverage and gap warnings.
 
-**LTC/BTC/XRP in 2013** — Coverage is very sparse. Exchanges were young, liquidity was thin, and many minutes had no trades.
+**Kraken rate limits** — Kraken's public API rate-limits aggressively for pre-2017 data. Bitfinex and Bitstamp are usually sufficient for BTC coverage.
 
-**Kraken rate limits** — Kraken's public API rate-limits aggressively. For full years of pre-2017 data, Kraken may return `EGeneral:Too many requests` for some months and be skipped. Bitfinex and Bitstamp are usually sufficient for BTC coverage.
-
-**Gap warnings are informational** — A "missing candles" warning means no trades occurred in that minute on the source exchange. This is normal for illiquid pairs and early years — it is not a data error.
+**Gap warnings are informational** — A "missing candles" warning means no trades occurred in that minute on the source exchange. This is normal for illiquid pairs and early years.
 
 ---
 
 ## Verified test results
 
-| Command | Candles | Notes |
-|---------|---------|-------|
-| `btcusdt --year 2023` | 525,520 | 100% coverage all months |
-| `btcusdt --year 2014` | 525,600 | 100% coverage, Bitfinex + Bitstamp merged |
-| `btcusdt --year 2015` | 525,600 | 100% coverage, Bitfinex + Bitstamp merged |
-| `ethusdt --year 2016` | 85,818 | Sparse but historically accurate |
-| `ltcusdt --year 2013` | 18,645 | Very early LTC data, Bitfinex only |
-| `dogeusdt --year 2015` | 0 | Correct — DOGE/USDT didn't exist |
+| Command | Sources used | Candles |
+|---------|-------------|---------|
+| `btcusdt --year 2023` | Binance only (≥99% every month) | 525,520 |
+| `btcusdt --year 2014` | Bitfinex + Bitstamp (merged to 100%) | 525,600 |
+| `btcusdt --start "2023-03-15 09:45" --end "2023-06-20 16:00"` | Binance only | 139,976 |
+| `ethusdt --year 2016` | Bitfinex + Bitstamp | 85,818 |
+| `ltcusdt --year 2013` | Bitfinex only | 18,645 |
+| `dogeusdt --year 2015` | — | 0 (correct — DOGE/USDT didn't exist) |

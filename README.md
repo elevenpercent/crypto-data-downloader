@@ -85,12 +85,12 @@ Each zip contains a single CSV file with these columns:
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `timestamp` | integer | Unix milliseconds (UTC) |
+| `timestamp` | integer | Unix milliseconds (UTC) — marks candle open time |
 | `open` | float | Open price |
 | `high` | float | High price |
 | `low` | float | Low price |
 | `close` | float | Close price |
-| `volume` | float | Volume in base currency |
+| `volume` | float | Base asset volume |
 
 Example (`btcusdt_2023.csv`):
 ```

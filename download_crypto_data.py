@@ -2,18 +2,55 @@
 """
 Download historical 1-minute OHLCV crypto data.
 
-Source priority:
-  >= 2019 : Binance Vision → OKX → Bybit*
-  2017-18 : Binance Vision → OKX (from 2019)
-  2013-16 : Bitfinex → Kraken → Bitstamp
-  2011-12 : Bitstamp only
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+V1 MODE  (default — no extra flags)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+One authoritative source per time period, chosen automatically:
+
+  2017–present → Binance Vision (monthly bulk downloads, fastest)
+  2013–2016    → Bitfinex       (falls back to Bitstamp if symbol
+                                 is unsupported or returns no data)
+  2011–2012    → Bitstamp
+
+No multi-source merging, no coverage logic, no gap detection.
+Simple, deterministic, bulletproof.
+
+  python download_crypto_data.py --symbol btcusdt --year 2023
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+V2 MODE  (opt-in with --multi)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All supported sources tried in priority order.  Results are merged
+with deduplication.  Once coverage reaches ≥99% for a month,
+remaining sources are skipped.  Gaps are reported after each month.
+
+  >= 2019 : Binance Vision → OKX → Bybit
+  2017–18 : Binance Vision → OKX
+  2013–16 : Bitfinex → Kraken → Bitstamp
+  2011–12 : Bitstamp
 
   * Bybit spot: geo-blocked from some regions (403), skipped gracefully
   * Coinbase: now requires auth — not included
   * Poloniex new API: no 1-min historical depth — not included
 
+  python download_crypto_data.py --symbol btcusdt --year 2014 --multi
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DATE RANGE  (works in both V1 and V2, mutually exclusive with --year)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  --start "2013-01-02 09:45"  --end "2013-12-20 16:00"
+  --start 2013-01-02          --end 2013-12-20   (00:00 UTC default)
+
+Only the months needed are fetched.  Candles are trimmed to the exact
+start/end timestamps (inclusive).  Max range: 10 years.
+Output: AllData/{symbol}/{symbol}_{start-date}_{end-date}.zip
+
+  python download_crypto_data.py --symbol btcusdt \\
+      --start "2023-03-15 09:45" --end "2023-06-20 16:00"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Accept symbol as: btcusdt / BTC/USDT / btc-usdt / BTCUSDT
-Output: AllData/{symbol}/{symbol}_{year}.zip
+Output: AllData/{symbol}/{symbol}_{year}.zip  or  ..._{start}_{end}.zip
 CSV   : timestamp(ms), open, high, low, close, volume
 """
 
@@ -121,6 +158,31 @@ def _month_bounds_ms(year, month):
 
 def _expected_candles(year, month):
     return calendar.monthrange(year, month)[1] * 24 * 60
+
+
+def _parse_datetime(s):
+    """Parse 'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM' → aware UTC datetime."""
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(s.strip(), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    raise ValueError(
+        f'Cannot parse date: {s!r}  (use YYYY-MM-DD or "YYYY-MM-DD HH:MM")'
+    )
+
+
+def _months_in_range(start_dt, end_dt):
+    """Return list of (year, month) tuples covering start_dt through end_dt."""
+    result = []
+    y, m = start_dt.year, start_dt.month
+    while (y, m) <= (end_dt.year, end_dt.month):
+        result.append((y, m))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    return result
 
 
 # ── Exchange symbol maps ───────────────────────────────────────────────────────
@@ -407,9 +469,9 @@ SOURCES = {
     'bitstamp': {'fn': _bitstamp_month, 'pairs': _BSTAMP_PAIRS, 'since': 2011},
 }
 
-_MODERN_ORDER = ('binance', 'okx', 'bybit')
-_LEGACY_ORDER = ('bitfinex', 'kraken', 'bitstamp')
-_FULL_THRESHOLD = 0.99   # skip remaining sources once coverage hits this
+_MODERN_ORDER  = ('binance', 'okx', 'bybit')
+_LEGACY_ORDER  = ('bitfinex', 'kraken', 'bitstamp')
+_FULL_THRESHOLD = 0.99   # V2: skip remaining sources once coverage hits this
 
 
 def _supports(name, symbol):
@@ -419,7 +481,97 @@ def _supports(name, symbol):
     return symbol.lower() in (meta.get('pairs') or {})
 
 
-def _plan_sources(symbol, year, force=None):
+# ── V1: single authoritative source per era ────────────────────────────────────
+
+def _v1_source(symbol, year):
+    """Return the single authoritative source name for V1 mode.
+
+    2017+     → binance
+    2013-2016 → bitfinex (if symbol mapped), else bitstamp
+    2011-2012 → bitstamp
+    Returns None if the symbol is unsupported for that era.
+    """
+    if year >= 2017:
+        return 'binance'
+    elif year >= 2013:
+        if symbol.lower() in _BFX_PAIRS:
+            return 'bitfinex'
+        if symbol.lower() in _BSTAMP_PAIRS:
+            return 'bitstamp'
+        return None
+    else:  # 2011-2012
+        if symbol.lower() in _BSTAMP_PAIRS:
+            return 'bitstamp'
+        return None
+
+
+def _fetch_month_v1(symbol, year, month, src):
+    """Fetch one month from the V1 source.
+    For 'bitfinex': if 0 candles returned, fall back to Bitstamp automatically.
+    """
+    try:
+        rows = SOURCES[src]['fn'](symbol, year, month)
+    except Exception as e:
+        print(f'  {src}: error — {e}')
+        rows = []
+
+    # Bitfinex → Bitstamp fallback when no data comes back
+    if src == 'bitfinex' and not rows:
+        if symbol.lower() in _BSTAMP_PAIRS:
+            print(f'  Bitfinex returned no data — falling back to Bitstamp')
+            try:
+                rows = SOURCES['bitstamp']['fn'](symbol, year, month)
+            except Exception as e:
+                print(f'  bitstamp: error — {e}')
+                rows = []
+
+    return rows
+
+
+def download_v1(symbol, year_months, start_ms=None, end_ms=None, force_source=None):
+    """V1 mode: one authoritative source per era, no merging.
+
+    year_months : list of (year, month) tuples to download
+    start_ms    : if set, filter out candles before this timestamp (inclusive)
+    end_ms      : if set, filter out candles after this timestamp (inclusive)
+    force_source: override automatic source selection (honours --source flag)
+    """
+    print(f'Mode    : V1 (single source per era)')
+    print(f'Symbol  : {symbol.upper()}')
+    print()
+
+    all_rows = []
+    total    = len(year_months)
+
+    for i, (year, month) in enumerate(year_months, 1):
+        src = force_source if force_source else _v1_source(symbol, year)
+        if src is None:
+            print(f'[{i:02d}/{total:02d}] {year}-{month:02d}  — no V1 source available, skipping')
+            print()
+            continue
+
+        ym       = f'{year}-{month:02d}'
+        expected = _expected_candles(year, month)
+        print(f'[{i:02d}/{total:02d}] {ym}  source={src}  (expect ~{expected:,} candles)')
+
+        rows = _fetch_month_v1(symbol, year, month, src)
+        print(f'  Got {len(rows):,} candles')
+        all_rows.extend(rows)
+        print()
+
+    # Trim to exact date range if requested
+    if start_ms is not None:
+        all_rows = [r for r in all_rows if r[0] >= start_ms]
+    if end_ms is not None:
+        all_rows = [r for r in all_rows if r[0] <= end_ms]
+
+    return all_rows
+
+
+# ── V2: multi-source merge ─────────────────────────────────────────────────────
+
+def _v2_sources(symbol, year, force=None):
+    """Return ordered source list for V2 mode."""
     if force:
         return [force]
     order = _MODERN_ORDER if year >= 2017 else _LEGACY_ORDER
@@ -428,8 +580,6 @@ def _plan_sources(symbol, year, force=None):
         if year >= SOURCES[name]['since'] and _supports(name, symbol)
     ]
 
-
-# ── Gap detection ──────────────────────────────────────────────────────────────
 
 def _check_gaps(rows, year, month):
     if len(rows) < 2:
@@ -446,28 +596,32 @@ def _check_gaps(rows, year, month):
               f'in {year}-{month:02d}')
 
 
-# ── Orchestration ──────────────────────────────────────────────────────────────
+def download_v2(symbol, year_months, start_ms=None, end_ms=None, force_source=None):
+    """V2 mode (--multi): all sources tried in priority order, merged with dedup.
 
-def download_year(symbol, year, force_source=None):
-    sources = _plan_sources(symbol, year, force=force_source)
-
-    if not sources:
-        sys.exit(
-            f'No data source available for {symbol.upper()} in {year}.\n'
-            f'Run --list-pairs to see supported symbols.'
-        )
-
-    print(f'Source  : {" + ".join(sources)}')
+    year_months : list of (year, month) tuples to download
+    start_ms    : if set, filter out candles before this timestamp (inclusive)
+    end_ms      : if set, filter out candles after this timestamp (inclusive)
+    force_source: restrict to a single source (honours --source flag)
+    """
+    print(f'Mode    : V2 (multi-source merge)')
     print(f'Symbol  : {symbol.upper()}')
-    print(f'Year    : {year}')
     print()
 
     all_rows = []
+    total    = len(year_months)
 
-    for month in range(1, 13):
+    for i, (year, month) in enumerate(year_months, 1):
+        sources = _v2_sources(symbol, year, force=force_source)
+        if not sources:
+            print(f'[{i:02d}/{total:02d}] {year}-{month:02d}  — no sources available, skipping')
+            print()
+            continue
+
         ym       = f'{year}-{month:02d}'
         expected = _expected_candles(year, month)
-        print(f'[{month:02d}/12] {ym}  (expect ~{expected:,} candles)')
+        print(f'[{i:02d}/{total:02d}] {ym}  sources={"+".join(sources)}  '
+              f'(expect ~{expected:,} candles)')
 
         month_rows, seen_ts = [], set()
 
@@ -504,6 +658,12 @@ def download_year(symbol, year, force_source=None):
 
         all_rows.extend(month_rows)
         print()
+
+    # Trim to exact date range if requested
+    if start_ms is not None:
+        all_rows = [r for r in all_rows if r[0] >= start_ms]
+    if end_ms is not None:
+        all_rows = [r for r in all_rows if r[0] <= end_ms]
 
     return all_rows
 
@@ -545,14 +705,31 @@ def cmd_list_pairs():
     print('  - ETH/USD pairs generally start late 2015 / early 2016')
     print()
     print('Usage examples:')
+    print('  # V1 (default) — single best source per era')
     print('  python download_crypto_data.py --symbol btcusdt --year 2023')
     print('  python download_crypto_data.py --symbol BTC/USDT --year 2014')
-    print('  python download_crypto_data.py --symbol ethusdt  --year 2016 --source bitfinex')
+    print()
+    print('  # V2 (--multi) — all sources merged')
+    print('  python download_crypto_data.py --symbol btcusdt --year 2014 --multi')
+    print()
+    print('  # Date range (works in V1 and V2)')
+    print('  python download_crypto_data.py --symbol btcusdt \\')
+    print('      --start "2023-03-15 09:45" --end "2023-06-20 16:00"')
+    print('  python download_crypto_data.py --symbol btcusdt \\')
+    print('      --start "2014-01-02" --end "2014-04-30" --multi')
+    print()
+    print('  # Force a specific exchange')
+    print('  python download_crypto_data.py --symbol ethusdt --year 2016 --source bitfinex')
 
 
 # ── Output ─────────────────────────────────────────────────────────────────────
 
-def save(symbol, year, rows):
+def save(symbol, label, rows):
+    """Write rows to AllData/{symbol}/{symbol}_{label}.zip.
+
+    label : '2023'  or  '2023-03-15_2023-06-20'
+    rows  : list of (timestamp_ms, open, high, low, close, volume)
+    """
     if not rows:
         print('No data to save.')
         return
@@ -566,8 +743,8 @@ def save(symbol, year, rows):
 
     out_dir  = os.path.join('AllData', symbol.lower())
     os.makedirs(out_dir, exist_ok=True)
-    zip_path = os.path.join(out_dir, f'{symbol.lower()}_{year}.zip')
-    csv_name = f'{symbol.lower()}_{year}.csv'
+    zip_path = os.path.join(out_dir, f'{symbol.lower()}_{label}.zip')
+    csv_name = f'{symbol.lower()}_{label}.csv'
 
     buf = io.StringIO()
     w   = csv.writer(buf)
@@ -579,16 +756,30 @@ def save(symbol, year, rows):
 
     print(f'Saved  : {zip_path}')
     print(f'Candles: {len(deduped):,}')
+    if deduped:
+        def _fmt(ms):
+            return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        print(f'First  : {_fmt(deduped[0][0])}')
+        print(f'Last   : {_fmt(deduped[-1][0])}')
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Download 1-minute crypto OHLCV data')
+    parser = argparse.ArgumentParser(
+        description='Download 1-minute crypto OHLCV data  (V1 default, --multi for V2)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument('--symbol',     help='Trading pair, e.g. btcusdt or BTC/USDT')
-    parser.add_argument('--year',       type=int, help='Year, e.g. 2023')
+    parser.add_argument('--year',       type=int, help='Full calendar year, e.g. 2023')
+    parser.add_argument('--start',      metavar='DATE',
+                        help='Range start: "2013-01-02" or "2013-01-02 09:45"')
+    parser.add_argument('--end',        metavar='DATE',
+                        help='Range end:   "2013-12-20" or "2013-12-20 16:00"')
+    parser.add_argument('--multi',      action='store_true',
+                        help='V2 mode: merge all available sources')
     parser.add_argument('--source',     choices=list(SOURCES), default=None,
-                        help='Force a specific exchange')
+                        help='Force a specific exchange (overrides auto-selection)')
     parser.add_argument('--list-pairs', action='store_true',
                         help='Show all supported pairs and exit')
     args = parser.parse_args()
@@ -597,9 +788,49 @@ if __name__ == '__main__':
         cmd_list_pairs()
         sys.exit(0)
 
-    if not args.symbol or not args.year:
-        parser.error('--symbol and --year are required (or use --list-pairs)')
+    if not args.symbol:
+        parser.error('--symbol is required (or use --list-pairs)')
 
-    sym  = normalize(args.symbol)
-    rows = download_year(sym, args.year, force_source=args.source)
-    save(sym, args.year, rows)
+    # Validate mode flags
+    if args.year and (args.start or args.end):
+        parser.error('--year and --start/--end are mutually exclusive')
+    if bool(args.start) != bool(args.end):
+        parser.error('--start and --end must be used together')
+    if not args.year and not args.start:
+        parser.error('one of --year or --start/--end is required')
+
+    sym = normalize(args.symbol)
+
+    # Build the (year, month) work list and range filter timestamps
+    if args.year:
+        year_months = [(args.year, m) for m in range(1, 13)]
+        start_ms = end_ms = None
+        label    = str(args.year)
+    else:
+        try:
+            start_dt = _parse_datetime(args.start)
+            end_dt   = _parse_datetime(args.end)
+        except ValueError as e:
+            parser.error(str(e))
+
+        if start_dt >= end_dt:
+            parser.error('--start must be before --end')
+        if (end_dt - start_dt).days > 10 * 365:
+            parser.error('Date range exceeds the 10-year maximum')
+
+        year_months = _months_in_range(start_dt, end_dt)
+        start_ms    = int(start_dt.timestamp()) * 1000
+        end_ms      = int(end_dt.timestamp()) * 1000
+        label       = f'{start_dt.strftime("%Y-%m-%d")}_{end_dt.strftime("%Y-%m-%d")}'
+
+    # Dispatch to V1 or V2
+    if args.multi:
+        rows = download_v2(sym, year_months,
+                           start_ms=start_ms, end_ms=end_ms,
+                           force_source=args.source)
+    else:
+        rows = download_v1(sym, year_months,
+                           start_ms=start_ms, end_ms=end_ms,
+                           force_source=args.source)
+
+    save(sym, label, rows)
